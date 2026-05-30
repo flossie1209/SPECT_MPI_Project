@@ -6,10 +6,9 @@ Project:
     CNN-based automated detection of myocardial ischemia from SPECT MPI polar maps.
 
 Task:
-    3-class classification:
-        - normal
-        - ischemia
-        - infarction
+    Binary classification:
+        - Normal
+        - Abnormal
 
 Expected folder structure:
 
@@ -17,17 +16,14 @@ Expected folder structure:
     ├── cnn_pipeline_spect_mpi.py
     ├── data/
     │   ├── train/
-    │   │   ├── normal/
-    │   │   ├── ischemia/
-    │   │   └── infarction/
+    │   │   ├── Normal/
+    │   │   └── Abnormal/
     │   ├── val/
-    │   │   ├── normal/
-    │   │   ├── ischemia/
-    │   │   └── infarction/
+    │   │   ├── Normal/
+    │   │   └── Abnormal/
     │   └── test/
-    │       ├── normal/
-    │       ├── ischemia/
-    │       └── infarction/
+    │       ├── Normal/
+    │       └── Abnormal/
     └── results/
 
 Run from terminal:
@@ -50,7 +46,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from sklearn.metrics import (
     classification_report,
@@ -141,7 +137,7 @@ def build_transforms(img_size: int = 224):
     return train_transforms, val_test_transforms
 
 
-def build_dataloaders(data_dir: str, img_size: int, batch_size: int, num_workers: int):
+def build_dataloaders(data_dir: str, img_size: int, batch_size: int, num_workers: int, use_weighted_sampler: bool = False):
     """
     Load train, validation, and test datasets using torchvision.datasets.ImageFolder.
     """
@@ -174,12 +170,33 @@ def build_dataloaders(data_dir: str, img_size: int, batch_size: int, num_workers
     if len(test_dataset) == 0:
         raise ValueError("Test dataset is empty. Check your data/test folders.")
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-    )
+    if use_weighted_sampler:
+        # Oversample the minority class during training so batches are more balanced.
+        # This is useful for the small, imbalanced Normal vs Abnormal dataset.
+        train_labels = [label for _, label in train_dataset.samples]
+        class_sample_counts = np.bincount(train_labels)
+        class_weights_for_sampler = 1.0 / class_sample_counts
+        sample_weights = [class_weights_for_sampler[label] for label in train_labels]
+
+        sampler = WeightedRandomSampler(
+            weights=torch.DoubleTensor(sample_weights),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+        )
 
     val_loader = DataLoader(
         val_dataset,
@@ -201,23 +218,101 @@ def build_dataloaders(data_dir: str, img_size: int, batch_size: int, num_workers
 # -----------------------------
 # Model
 # -----------------------------
-
-def build_model(num_classes: int = 3, pretrained: bool = True):
+class CustomCNN(nn.Module):
     """
-    Build a ResNet18 model for 3-class SPECT MPI classification.
+    Custom CNN from scratch for binary SPECT MPI classification.
+
+    Architecture:
+        Input image
+        → Conv block 1
+        → Conv block 2
+        → Conv block 3
+        → Conv block 4
+        → Global average pooling
+        → Fully connected classifier
+        → Normal/Abnormal prediction
     """
 
-    if pretrained:
-        weights = models.ResNet18_Weights.DEFAULT
+    def __init__(self, num_classes: int = 2):
+        super(CustomCNN, self).__init__()
+
+        self.features = nn.Sequential(
+            # Block 1: 3 x 224 x 224 -> 16 x 112 x 112
+            nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+
+            # Block 2: 16 x 112 x 112 -> 32 x 56 x 56
+            nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+
+            # Block 3: 32 x 56 x 56 -> 64 x 28 x 28
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+
+            # Block 4: 64 x 28 x 28 -> 128 x 14 x 14
+            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+        )
+
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.pool(x)
+        x = self.classifier(x)
+        return x
+    
+    
+def build_model(num_classes: int = 2, model_name: str = "resnet18", pretrained: bool = True):
+    """
+    Build either:
+        - Custom CNN from scratch
+        - ResNet18 transfer learning model
+    """
+
+    if model_name == "custom":
+        print("Using custom CNN from scratch.")
+        model = CustomCNN(num_classes=num_classes)
+        return model
+
+    elif model_name == "resnet18":
+        print("Using ResNet18.")
+
+        if pretrained:
+            print("Using ImageNet pretrained weights.")
+            weights = models.ResNet18_Weights.DEFAULT
+        else:
+            print("Training ResNet18 from scratch.")
+            weights = None
+
+        model = models.resnet18(weights=weights)
+
+        # Replace final fully connected layer.
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
+
+        return model
+
     else:
-        weights = None
+        raise ValueError(f"Unknown model_name: {model_name}. Use 'custom' or 'resnet18'.")
+    
 
-    model = models.resnet18(weights=weights)
-
-    # Replace final fully connected layer.
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
-
-    return model
 
 
 # -----------------------------
@@ -486,8 +581,15 @@ def generate_gradcam_examples(model, test_dataset, class_names, device, results_
 
     model.eval()
 
-    # For ResNet18, the last convolutional block is layer4[-1].
-    target_layers = [model.layer4[-1]]
+    # Select the last convolutional layer depending on the model architecture.
+    if hasattr(model, "layer4"):
+        # ResNet18
+        target_layers = [model.layer4[-1]]
+    elif hasattr(model, "features"):
+        # CustomCNN: last convolutional block is inside model.features
+        target_layers = [model.features[-4]]
+    else:
+        raise ValueError("Grad-CAM target layer could not be identified for this model.")
 
     # Pick a few evenly spaced examples from the test set.
     n_examples = min(n_examples, len(test_dataset))
@@ -553,6 +655,7 @@ def main(args):
         img_size=args.img_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        use_weighted_sampler=args.weighted_sampler,
     )
 
     class_names = train_dataset.classes
@@ -566,10 +669,10 @@ def main(args):
     print(f"Val images:   {len(val_dataset)}")
     print(f"Test images:  {len(test_dataset)}")
 
-    if num_classes != 3:
+    if num_classes != 2:
         warnings.warn(
-            f"Expected 3 classes, but found {num_classes}. "
-            "The script will still run, but check your folders."
+            f"Expected 2 classes for binary classification, but found {num_classes}. "
+            "Check that your folders are data/train/Normal and data/train/Abnormal."
         )
 
     # Save class mapping.
@@ -578,7 +681,11 @@ def main(args):
     ).to_csv(results_dir / "class_mapping.csv", index=False)
 
     print("\nBuilding model...")
-    model = build_model(num_classes=num_classes, pretrained=not args.no_pretrained)
+    model = build_model(
+        num_classes=num_classes,
+        model_name=args.model,
+        pretrained=not args.no_pretrained
+    )
     model = model.to(device)
 
     from sklearn.utils.class_weight import compute_class_weight
@@ -600,7 +707,7 @@ def main(args):
 
     history_records = []
     best_val_acc = -np.inf
-    best_model_path = results_dir / "best_resnet18_spect_mpi.pth"
+    best_model_path = results_dir / f"best_{args.model}_spect_mpi.pth"
 
     print("\nStarting training...")
     for epoch in range(1, args.epochs + 1):
@@ -723,7 +830,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="CNN pipeline for SPECT MPI 3-class image classification."
+        description="CNN pipeline for SPECT MPI binary image classification."
     )
 
     parser.add_argument(
@@ -755,10 +862,24 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--weighted-sampler",
+        action="store_true",
+        help="Use WeightedRandomSampler to oversample the minority class during training.",
+    )
+
+    parser.add_argument(
         "--epochs",
         type=int,
         default=10,
         help="Number of training epochs. Default: 10.",
+    )
+
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="resnet18",
+        choices=["resnet18", "custom"],
+        help="Model architecture to use: 'resnet18' or 'custom'. Default: resnet18.",
     )
 
     parser.add_argument(

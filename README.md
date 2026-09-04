@@ -1,3 +1,13 @@
+---
+title: SPECT MPI Ischemia Classifier
+emoji: 🫀
+colorFrom: blue
+colorTo: purple
+sdk: gradio
+sdk_version: 4.44.0
+app_file: app.py
+pinned: false
+---
 # AI-Enabled Ischemia Detection from Myocardial Perfusion SPECT using Deep Learning
 
 ## Overview

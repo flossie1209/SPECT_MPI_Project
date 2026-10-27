@@ -127,7 +127,7 @@ demo = gr.Interface(
     title="SPECT MPI Ischemia Classifier",
     description=DESCRIPTION,
     examples=None,  # add paths to a few sample images here if you want one-click demos
-    allow_flagging="never",
+    flagging_mode="never",
 )
 
 if __name__ == "__main__":
